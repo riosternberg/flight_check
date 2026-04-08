@@ -1,0 +1,13 @@
+{
+  "name": "spontan-trips",
+  "version": "1.0.0",
+  "description": "Automatische Suche nach günstigen Spontan-Flügen von Berlin",
+  "main": "search.js",
+  "scripts": {
+    "start": "node search.js",
+    "test": "node search.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.9"
+  }
+}
