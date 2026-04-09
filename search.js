@@ -1,147 +1,218 @@
 const https = require("https");
 const nodemailer = require("nodemailer");
+const fs = require("fs");
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const SERPAPI_KEY = "cc824d14af98ebb20291985f57274bc87d499f0efbabbdc617b0fa246f47d699";
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "cc824d14af98ebb20291985f57274bc87d499f0efbabbdc617b0fa246f47d699";
 const EMAIL_TO    = "riosternberg@gmail.com";
-const MAX_PRICE   = 100;   // € Gesamtpreis hin & zurück
-const ORIGIN      = "BER"; // Berlin (alle Berliner Flughäfen)
-const MIN_NIGHTS  = 3;
-const MAX_NIGHTS  = 4;
+const MAX_PRICE   = 100;
+const ORIGIN      = "BER";
 
-// Suche Fr–Mo: Abflug Freitag, Rückflug Montag (3 Nächte) oder Sa→Di (4 Nächte)
-// Wir suchen die nächsten 8 Freitage/Samstage
-function getSearchDates() {
-  const pairs = [];
-  const today = new Date();
-  for (let i = 0; i <= 56; i++) {
-    const d = new Date(today);
-    d.setDate(today.getDate() + i);
-    const dow = d.getDay(); // 0=So, 5=Fr, 6=Sa
-    if (dow === 5 || dow === 6) {
-      for (const nights of [MIN_NIGHTS, MAX_NIGHTS]) {
-        const ret = new Date(d);
-        ret.setDate(d.getDate() + nights);
-        pairs.push({
-          out: fmt(d),
-          ret: fmt(ret),
-          label: `${fmt(d)} → ${fmt(ret)} (${nights} Nächte)`,
-        });
-      }
-    }
-  }
-  // Deduplizieren & auf 20 Paare begrenzen
-  const seen = new Set();
-  return pairs.filter(p => {
-    const k = p.out + p.ret;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  }).slice(0, 20);
-}
-
-function fmt(d) {
-  return d.toISOString().slice(0, 10);
-}
-
+// ─── Hilfsfunktionen ──────────────────────────────────────────────────────────
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, res => {
+    https.get(url, (res) => {
       let data = "";
-      res.on("data", c => data += c);
+      res.on("data", (c) => (data += c));
       res.on("end", () => {
         try { resolve(JSON.parse(data)); }
-        catch (e) { reject(e); }
+        catch (e) { reject(new Error("JSON parse error: " + data.slice(0, 200))); }
       });
     }).on("error", reject);
   });
 }
 
-async function searchFlight(outDate, retDate) {
-  const url = `https://serpapi.com/search.json?engine=google_flights` +
-    `&departure_id=${ORIGIN}&arrival_id=anywhere` +
-    `&outbound_date=${outDate}&return_date=${retDate}` +
-    `&currency=EUR&hl=de&type=1&api_key=${SERPAPI_KEY}`;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Schritt 1: google_travel_explore → alle günstigen Ziele von BER ──────────
+// duration=1 = Weekend, duration=2 = 1 Woche
+// Wir rufen beide ab, damit wir Fr-Mo UND längere Trips sehen
+async function exploreDestinations(duration) {
+  const url =
+    `https://serpapi.com/search.json?engine=google_travel_explore` +
+    `&departure_id=${ORIGIN}` +
+    `&currency=EUR&hl=de&gl=de` +
+    `&trip_duration=${duration}` +  // 1=Weekend, 2=1Woche
+    `&api_key=${SERPAPI_KEY}`;
+
+  console.log(`  → Explore (duration=${duration})...`);
+  const data = await fetchJson(url);
+
+  if (data.error) throw new Error("SerpApi Fehler: " + data.error);
+
+  const results = (data.destinations || []).filter(
+    (d) => d.price && d.price <= MAX_PRICE
+  );
+  return results;
+}
+
+// ─── Schritt 2: Für jeden Deal den genauen Flug holen ─────────────────────────
+async function getFlightDetails(dest) {
+  // Explore gibt start_date/end_date zurück — wir nutzen die direkt
+  const outDate = dest.start_date;
+  const retDate = dest.end_date;
+
+  if (!outDate || !retDate) return null;
+
+  const url =
+    `https://serpapi.com/search.json?engine=google_flights` +
+    `&departure_id=${ORIGIN}` +
+    `&arrival_id=${dest.destination_id || dest.code}` +
+    `&outbound_date=${outDate}` +
+    `&return_date=${retDate}` +
+    `&currency=EUR&hl=de&gl=de&type=1` +
+    `&api_key=${SERPAPI_KEY}`;
+
   try {
     const data = await fetchJson(url);
-    const results = [];
-    const flights = [
-      ...(data.best_flights || []),
-      ...(data.other_flights || []),
-    ];
-    for (const f of flights) {
-      const price = f.price;
-      if (price && price <= MAX_PRICE) {
-        const leg = f.flights?.[0];
-        results.push({
-          destination: leg?.arrival_airport?.name || "Unbekannt",
-          destCode: leg?.arrival_airport?.id || "?",
-          airline: leg?.airline || "?",
-          duration: f.total_duration,
-          price,
-          outDate,
-          retDate,
-          bookingUrl: `https://www.google.com/flights?hl=de#flt=${ORIGIN}.${leg?.arrival_airport?.id}.${outDate}*${leg?.arrival_airport?.id}.${ORIGIN}.${retDate}`,
-        });
-      }
-    }
-    return results;
+    const flights = [...(data.best_flights || []), ...(data.other_flights || [])];
+    const cheapest = flights.sort((a, b) => a.price - b.price)[0];
+
+    if (!cheapest || cheapest.price > MAX_PRICE) return null;
+
+    const leg = cheapest.flights?.[0];
+    return {
+      destination: dest.name,
+      country: dest.country || "",
+      destCode: leg?.arrival_airport?.id || dest.destination_id,
+      airline: leg?.airline || "?",
+      stops: cheapest.flights?.length > 1 ? cheapest.flights.length - 1 : 0,
+      duration: cheapest.total_duration,
+      price: cheapest.price,
+      outDate,
+      retDate,
+      googleFlightsUrl: data.search_parameters
+        ? `https://www.google.com/flights?hl=de#flt=${ORIGIN}.${leg?.arrival_airport?.id}.${outDate}*${leg?.arrival_airport?.id}.${ORIGIN}.${retDate}`
+        : dest.google_flights_url || "#",
+    };
   } catch (e) {
-    console.error(`Fehler bei ${outDate}→${retDate}:`, e.message);
-    return [];
+    console.warn(`    Fehler bei Flugdetails für ${dest.name}:`, e.message);
+    return null;
   }
 }
 
+// ─── E-Mail bauen ─────────────────────────────────────────────────────────────
 function buildEmailHtml(deals) {
+  const date = new Date().toLocaleDateString("de-DE", {
+    weekday: "long", day: "numeric", month: "long",
+  });
+
   if (deals.length === 0) {
-    return `<p>Heute leider keine Deals unter ${MAX_PRICE}€ gefunden. Morgen wieder!</p>`;
+    return `
+      <body style="font-family:sans-serif;padding:32px;color:#333;max-width:600px;margin:auto;">
+        <h2 style="font-size:22px;margin-bottom:8px;">✈️ Spontan-Trips · ${date}</h2>
+        <p style="color:#666;">Heute leider keine Flüge unter ${MAX_PRICE}€ gefunden. Morgen wieder!</p>
+        <p style="color:#999;font-size:12px;margin-top:32px;">Suche läuft täglich automatisch von Berlin (BER).</p>
+      </body>`;
   }
 
-  const rows = deals.map(d => `
-    <tr style="border-bottom:1px solid #eee;">
-      <td style="padding:12px 8px;font-weight:600;">${d.destination} (${d.destCode})</td>
-      <td style="padding:12px 8px;">${d.outDate} → ${d.retDate}</td>
-      <td style="padding:12px 8px;">${d.airline}</td>
-      <td style="padding:12px 8px;font-size:20px;font-weight:700;color:#1a7a4a;">€${d.price}</td>
-      <td style="padding:12px 8px;">
-        <a href="${d.bookingUrl}" style="background:#1a7a4a;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;">Buchen →</a>
+  const cards = deals.map((d) => {
+    const nights = Math.round(
+      (new Date(d.retDate) - new Date(d.outDate)) / 86400000
+    );
+    const stopsLabel = d.stops === 0 ? "Direktflug" : `${d.stops} Stopp`;
+    const durationH = Math.floor(d.duration / 60);
+    const durationM = d.duration % 60;
+
+    return `
+    <tr>
+      <td style="padding:0 0 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e8e8e8;border-radius:10px;overflow:hidden;">
+          <tr>
+            <td style="padding:16px 20px;background:#f9f9f9;border-bottom:1px solid #e8e8e8;">
+              <table width="100%"><tr>
+                <td>
+                  <div style="font-size:18px;font-weight:600;color:#111;">
+                    ${d.destination}
+                    <span style="font-size:13px;font-weight:400;color:#888;">${d.country}</span>
+                  </div>
+                  <div style="font-size:13px;color:#555;margin-top:4px;">
+                    ${formatDate(d.outDate)} → ${formatDate(d.retDate)}
+                    &nbsp;·&nbsp; ${nights} Nächte
+                  </div>
+                </td>
+                <td align="right" style="white-space:nowrap;">
+                  <div style="font-size:28px;font-weight:700;color:#1a7a4a;">€${d.price}</div>
+                  <div style="font-size:11px;color:#888;">hin & zurück p.P.</div>
+                </td>
+              </tr></table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:14px 20px;">
+              <table width="100%"><tr>
+                <td style="font-size:13px;color:#555;">
+                  ${d.airline} · ${stopsLabel}
+                  ${d.duration ? ` · ${durationH}h${durationM > 0 ? durationM + "m" : ""}` : ""}
+                </td>
+                <td align="right">
+                  <a href="${d.googleFlightsUrl}"
+                     style="display:inline-block;background:#1a7a4a;color:#fff;padding:8px 18px;
+                            border-radius:6px;text-decoration:none;font-size:13px;font-weight:500;">
+                    Jetzt buchen →
+                  </a>
+                </td>
+              </tr></table>
+            </td>
+          </tr>
+        </table>
       </td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
 
   return `
 <!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="font-family:sans-serif;max-width:700px;margin:0 auto;padding:20px;color:#222;">
-  <h1 style="font-size:24px;margin-bottom:4px;">✈️ Deine Spontan-Trip Deals</h1>
-  <p style="color:#666;margin-bottom:24px;">
-    ${deals.length} Flug${deals.length > 1 ? "e" : ""} unter ${MAX_PRICE}€ von Berlin · ${new Date().toLocaleDateString("de-DE")}
-  </p>
-  <table style="width:100%;border-collapse:collapse;font-size:14px;">
-    <thead>
-      <tr style="background:#f5f5f5;text-align:left;">
-        <th style="padding:10px 8px;">Ziel</th>
-        <th style="padding:10px 8px;">Reisedaten</th>
-        <th style="padding:10px 8px;">Airline</th>
-        <th style="padding:10px 8px;">Preis</th>
-        <th style="padding:10px 8px;"></th>
-      </tr>
-    </thead>
-    <tbody>${rows}</tbody>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+             background:#f4f4f4;padding:24px;margin:0;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0"
+             style="background:#fff;border-radius:12px;overflow:hidden;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="background:#111;padding:24px 32px;">
+            <div style="font-size:22px;font-weight:600;color:#fff;">✈️ Spontan-Trips</div>
+            <div style="font-size:13px;color:#aaa;margin-top:4px;">
+              ${deals.length} Deal${deals.length > 1 ? "s" : ""} unter ${MAX_PRICE}€ · ${date}
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:24px 32px;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              ${cards}
+            </table>
+            <p style="font-size:11px;color:#bbb;margin-top:8px;">
+              Preise von Google Flights. Bitte nochmal auf der Buchungsseite prüfen.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
   </table>
-  <p style="margin-top:32px;color:#999;font-size:12px;">
-    Preise sind Richtwerte von Google Flights. Immer nochmal auf der Buchungsseite prüfen.
-  </p>
-</body>
-</html>`;
+</body></html>`;
 }
 
-async function sendEmail(deals) {
-  // Nutzt Gmail SMTP über OAuth-less App-Password oder direkt Nodemailer
-  // Für den ersten Test: Ausgabe in Konsole + Datei
-  const html = buildEmailHtml(deals);
+function formatDate(iso) {
+  return new Date(iso).toLocaleDateString("de-DE", {
+    weekday: "short", day: "numeric", month: "short",
+  });
+}
 
-  // Versuche echten Versand via SMTP (braucht EMAIL_USER + EMAIL_PASS env vars)
+// ─── E-Mail senden ────────────────────────────────────────────────────────────
+async function sendEmail(deals) {
+  const html = buildEmailHtml(deals);
+  const subject = deals.length > 0
+    ? `✈️ ${deals.length} Spontan-Deal${deals.length > 1 ? "s" : ""} unter ${MAX_PRICE}€ · ${new Date().toLocaleDateString("de-DE")}`
+    : `✈️ Keine Deals heute · ${new Date().toLocaleDateString("de-DE")}`;
+
+  // Vorschau immer speichern
+  fs.writeFileSync("email-preview.html", html);
+  console.log("\n📄 E-Mail-Vorschau gespeichert: email-preview.html");
+
   if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
     const transporter = nodemailer.createTransport({
       service: "gmail",
@@ -150,48 +221,70 @@ async function sendEmail(deals) {
     await transporter.sendMail({
       from: `Spontan Trips <${process.env.EMAIL_USER}>`,
       to: EMAIL_TO,
-      subject: `✈️ ${deals.length} Spontan-Deals unter ${MAX_PRICE}€ · ${new Date().toLocaleDateString("de-DE")}`,
+      subject,
       html,
     });
-    console.log(`E-Mail an ${EMAIL_TO} gesendet!`);
+    console.log(`📧 E-Mail gesendet an ${EMAIL_TO}`);
   } else {
-    // Speichert HTML-Vorschau lokal
-    require("fs").writeFileSync("email-preview.html", html);
-    console.log("EMAIL_USER/EMAIL_PASS nicht gesetzt → email-preview.html gespeichert");
+    console.log("⚠️  EMAIL_USER/EMAIL_PASS nicht gesetzt → nur Vorschau-Datei");
   }
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log("🔍 Suche Spontan-Trips von Berlin...\n");
-  const dates = getSearchDates();
-  console.log(`Prüfe ${dates.length} Datumskombinationen (Fr/Sa → Mo/Di)...\n`);
+  console.log("🔍 Spontan-Trip Suche startet...\n");
 
-  const allDeals = [];
-  for (const { out, ret, label } of dates) {
-    process.stdout.write(`  ${label} ... `);
-    const deals = await searchFlight(out, ret);
-    if (deals.length > 0) {
-      console.log(`${deals.length} Deal(s) gefunden!`);
-      allDeals.push(...deals);
-    } else {
-      console.log("nichts unter 100€");
+  let rawDeals = [];
+
+  // Explore für Weekends (Fr–Mo) und kurze Trips (Mo–Fr Woche)
+  for (const dur of [1, 2]) {
+    try {
+      const destinations = await exploreDestinations(dur);
+      console.log(`  ✓ ${destinations.length} Ziele unter ${MAX_PRICE}€ gefunden (duration=${dur})`);
+      rawDeals.push(...destinations);
+    } catch (e) {
+      console.error(`  ✗ Explore Fehler (duration=${dur}):`, e.message);
     }
-    // Kurze Pause um Rate Limits zu vermeiden
-    await new Promise(r => setTimeout(r, 500));
+    await sleep(600);
   }
 
-  // Sortiere nach Preis
-  allDeals.sort((a, b) => a.price - b.price);
+  // Deduplizieren nach Zielname
+  const seen = new Set();
+  rawDeals = rawDeals.filter((d) => {
+    if (seen.has(d.name)) return false;
+    seen.add(d.name);
+    return true;
+  });
 
-  console.log(`\n✅ Gesamt: ${allDeals.length} Deal(s) gefunden`);
-  if (allDeals.length > 0) {
-    console.log("\nBeste Deals:");
-    allDeals.slice(0, 5).forEach(d =>
+  console.log(`\n📍 ${rawDeals.length} einzigartige Ziele gefunden. Hole Flugdetails...\n`);
+
+  const deals = [];
+  for (const dest of rawDeals) {
+    process.stdout.write(`  ${dest.name} (€${dest.price}) ... `);
+    const detail = await getFlightDetails(dest);
+    if (detail) {
+      console.log(`✓ €${detail.price} · ${detail.outDate} → ${detail.retDate}`);
+      deals.push(detail);
+    } else {
+      console.log("übersprungen");
+    }
+    await sleep(400);
+  }
+
+  deals.sort((a, b) => a.price - b.price);
+
+  console.log(`\n✅ ${deals.length} bestätigte Deals unter ${MAX_PRICE}€`);
+  if (deals.length > 0) {
+    console.log("\nTop Deals:");
+    deals.slice(0, 5).forEach((d) =>
       console.log(`  €${d.price} · ${d.destination} · ${d.outDate} → ${d.retDate}`)
     );
   }
 
-  await sendEmail(allDeals);
+  await sendEmail(deals);
 }
 
-main().catch(console.error);
+main().catch((e) => {
+  console.error("Fataler Fehler:", e);
+  process.exit(1);
+});
